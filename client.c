@@ -3,7 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <errno.h> // Add this header file
+#include <errno.h>
 
 #define SERVER_IP "127.0.0.1"
 #define BUFFER_SIZE 1024
@@ -63,6 +63,7 @@ int main(int argc, char *argv[]) {
         if (FD_ISSET(STDIN_FILENO, &readfds)) {
             if (fgets(buffer, BUFFER_SIZE, stdin) != NULL) {
                 send(sockfd, buffer, strlen(buffer), 0);
+                // After sending a message, print the prompt again
                 printf("Enter message: ");
                 fflush(stdout);
             }
@@ -72,9 +73,23 @@ int main(int argc, char *argv[]) {
             int n = recv(sockfd, buffer, BUFFER_SIZE, 0);
             if (n > 0) {
                 buffer[n] = '\0';
-                printf("Server: %s\n", buffer);
+
+                // Parse the message to extract the sender information and content
+                int sender_client_id;
+                char message_content[BUFFER_SIZE];
+
+                if (sscanf(buffer, "from client %d: %[^\n]", &sender_client_id, message_content) == 2) {
+                    printf("\nReceived broadcast message: from client %d: %s\n", sender_client_id, message_content);
+
+                } else {
+                    // Fallback if the format is different
+                    printf("\nReceived broadcast message: %s\n", buffer);
+                }
+
+                // Print the prompt again after displaying the received message
                 printf("Enter message: ");
                 fflush(stdout);
+
             } else if (n == 0) {
                 printf("Server closed the connection\n");
                 break;

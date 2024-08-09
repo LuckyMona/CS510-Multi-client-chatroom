@@ -6,20 +6,17 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <fcntl.h>
 #include <errno.h>
 
 #define BUFFER_SIZE 1024
 #define MAX_CLIENTS 5
 
-int child_pipes[MAX_CLIENTS][2]; // Pipes for each child process
-pid_t child_pids[MAX_CLIENTS] = {0}; // PIDs for child processes
+int client_sockets[MAX_CLIENTS] = {0}; // Store client sockets
 
 // Function declarations
 void error(const char *msg);
-void broadcast(const char *message, size_t len);
-void handle_client(int client_index, int client_fd);
-void close_all_pipes();
+void broadcast(int sender_index, const char *message);
+void close_all_sockets();
 void log_connection(struct sockaddr_in *client_addr);
 void log_disconnection(int client_index);
 void log_message(int client_index, const char *message);
@@ -69,6 +66,7 @@ void start_server(int port) {
 
     FD_ZERO(&masterfds);
     FD_SET(server_fd, &masterfds);
+    FD_SET(STDIN_FILENO, &masterfds); // Add STDIN to the master set
 
     while (1) {
         readfds = masterfds;
@@ -82,7 +80,7 @@ void start_server(int port) {
         // Check for new connections
         if (FD_ISSET(server_fd, &readfds)) {
             for (i = 0; i < MAX_CLIENTS; ++i) {
-                if (child_pids[i] <= 0) {
+                if (client_sockets[i] == 0) {
                     break;
                 }
             }
@@ -98,95 +96,83 @@ void start_server(int port) {
 
             log_connection(&client_addr);
 
-            // Create pipe
-            if (pipe(child_pipes[i]) < 0) {
-                error("Could not create pipe");
-            }
+            // Save the client socket
+            client_sockets[i] = client_fd;
 
-            // Create child process
-            child_pids[i] = fork();
-            if (child_pids[i] == 0) {
-                // Child process closes server socket and unused pipe ends
-                close(server_fd);
-                close(child_pipes[i][1]); // Child process does not need write end
-                handle_client(i, client_fd);
-                close(client_fd);
-                exit(0);
-            } else if (child_pids[i] < 0) {
-                error("Fork failed");
-            }
-
-            // Parent process closes client socket's read end
-            close(client_fd);
-            close(child_pipes[i][0]); // Parent process does not need read end
-
-            FD_SET(child_pipes[i][1], &masterfds);
+            // Add new client socket to master set
+            FD_SET(client_fd, &masterfds);
         }
 
-        // Handle messages from child processes
+        // Handle messages from clients
         for (i = 0; i < MAX_CLIENTS; ++i) {
-            if (child_pids[i] > 0 && FD_ISSET(child_pipes[i][1], &readfds)) {
+            int sockfd = client_sockets[i];
+            if (sockfd > 0 && FD_ISSET(sockfd, &readfds)) {
                 char buffer[BUFFER_SIZE];
-                int n = read(child_pipes[i][1], buffer, sizeof(buffer));
+                int n = read(sockfd, buffer, sizeof(buffer));
                 if (n > 0) {
                     buffer[n] = '\0';
-                    printf("Broadcasting message from client %d: %s\n", i, buffer);
                     log_message(i, buffer);
-                    // Broadcast message to all clients
-                    broadcast(buffer, n);
+                    // Broadcast message to all clients, including the sender
+                    broadcast(i, buffer);
                 } else {
                     if (n < 0) {
-                        perror("Read from pipe failed");
+                        perror("Read from client failed");
                     } else {
                         log_disconnection(i);
                     }
-                    close(child_pipes[i][1]);
-                    child_pipes[i][1] = -1;
-                    child_pids[i] = 0;
-                    FD_CLR(child_pipes[i][1], &masterfds);
+                    close(client_sockets[i]);
+                    client_sockets[i] = 0;
+                    FD_CLR(sockfd, &masterfds);
                 }
+            }
+        }
+
+        // Check if the server wants to send a message to all clients
+        if (FD_ISSET(STDIN_FILENO, &readfds)) {
+            char buffer[BUFFER_SIZE];
+            if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
+                buffer[strcspn(buffer, "\n")] = '\0'; // Remove newline character
+                broadcast(-1, buffer); // Broadcast to all clients from the server itself
             }
         }
     }
 
-    close_all_pipes();
+    close_all_sockets();
     close(server_fd);
 }
 
-// Function to handle client connection
-void handle_client(int client_index, int client_fd) {
-    char buffer[BUFFER_SIZE];
-    while (1) {
-        int n = recv(client_fd, buffer, sizeof(buffer), 0);
-        if (n > 0) {
-            buffer[n] = '\0';
-            printf("Received from client %d: %s\n", client_index, buffer);
-            // Send message to parent process
-            write(child_pipes[client_index][1], buffer, n);
-        } else if (n == 0) {
-            printf("Client %d closed the connection\n", client_index);
-            break;
-        } else {
-            perror("recv failed");
-            break;
+// Function to broadcast a message to all clients
+void broadcast(int sender_index, const char *message) {
+    char formatted_message[BUFFER_SIZE];
+    if (sender_index >= 0) {
+        // Format message as "from client X: <message>"
+        snprintf(formatted_message, BUFFER_SIZE, "from client %d: %s", sender_index, message);
+    } else {
+        // If the server itself is sending the message
+        snprintf(formatted_message, BUFFER_SIZE, "from server: %s", message);
+    }
+
+    printf("Broadcasting message: %s\n", formatted_message); // Debug print
+
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        int sockfd = client_sockets[i];
+        if (sockfd > 0) { // Broadcast to all active clients
+            printf("Sending message to client %d\n", i); // Debug print
+
+            // The actual send operation
+            if (send(sockfd, formatted_message, strlen(formatted_message), 0) < 0) {
+                perror("Send to client failed");
+            }
         }
     }
 }
 
-// Function to broadcast message to all clients
-void broadcast(const char *message, size_t len) {
+// Function to close all sockets
+void close_all_sockets() {
     for (int i = 0; i < MAX_CLIENTS; i++) {
-        if (child_pipes[i][1] > 0) {
-            write(child_pipes[i][1], message, len); // Write to pipe
+        if (client_sockets[i] > 0) {
+            close(client_sockets[i]);
         }
-    }
-}
-
-// Function to close all pipes
-void close_all_pipes() {
-    for (int i = 0; i < MAX_CLIENTS; i++) {
-        close(child_pipes[i][0]);
-        close(child_pipes[i][1]);
     }
 }
 
@@ -204,9 +190,10 @@ void log_connection(struct sockaddr_in *client_addr) {
 // Function to log disconnection
 void log_disconnection(int client_index) {
     printf("Client %d disconnected\n", client_index);
+    client_sockets[client_index] = 0;
 }
 
 // Function to log messages
 void log_message(int client_index, const char *message) {
-    printf("Message from client %d: %s\n", client_index, message);
+    printf("\nReceived Message from client %d: %s\n", client_index, message);
 }
